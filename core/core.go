@@ -140,8 +140,8 @@ func RunBazeliskWithArgsFuncAndConfig(argsFunc ArgsFunc, repos *Repositories, co
 	// --print_env must be the first argument.
 	if len(args) > 0 && args[0] == "--print_env" {
 		// print environment variables for sub-processes
-		cmd := makeBazelCmd(bazelPath, args, nil, config)
-		for _, val := range cmd.Env {
+		_, _, env := makeBazelCmd(bazelPath, args, config)
+		for _, val := range env {
 			fmt.Println(val)
 		}
 		return 0, nil
@@ -198,7 +198,7 @@ func RunBazeliskWithArgsFuncAndConfig(argsFunc ArgsFunc, repos *Repositories, co
 		}
 	}
 
-	exitCode, err := runBazel(bazelPath, args, nil, config)
+	exitCode, err := execBazel(bazelPath, args, config)
 	if err != nil {
 		return -1, fmt.Errorf("could not run Bazel: %v", err)
 	}
@@ -526,34 +526,56 @@ func maybeDelegateToWrapper(bazel string, config config.Config) string {
 	return maybeDelegateToWrapperFromDir(bazel, wd, config)
 }
 
-func prependDirToPathList(cmd *exec.Cmd, dir string) {
+func prependDirToPathList(env []string, dir string) {
 	found := false
-	for idx, val := range cmd.Env {
+	for idx, val := range env {
 		splits := strings.Split(val, "=")
 		if len(splits) != 2 {
 			continue
 		}
 		if strings.EqualFold(splits[0], "PATH") {
 			found = true
-			cmd.Env[idx] = fmt.Sprintf("PATH=%s%s%s", dir, string(os.PathListSeparator), splits[1])
+			env[idx] = fmt.Sprintf("PATH=%s%s%s", dir, string(os.PathListSeparator), splits[1])
 			break
 		}
 	}
 
 	if !found {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("PATH=%s", dir))
+		env = append(env, fmt.Sprintf("PATH=%s", dir))
 	}
 }
 
-func makeBazelCmd(bazel string, args []string, out io.Writer, config config.Config) *exec.Cmd {
+func makeBazelCmd(bazel string, args []string, config config.Config) (string, []string, []string) {
 	execPath := maybeDelegateToWrapper(bazel, config)
 
-	cmd := exec.Command(execPath, args...)
-	cmd.Env = append(os.Environ(), skipWrapperEnv+"=true")
+	env := append(os.Environ(), skipWrapperEnv+"=true")
 	if execPath != bazel {
-		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", bazelReal, bazel))
+		env = append(env, fmt.Sprintf("%s=%s", bazelReal, bazel))
 	}
-	prependDirToPathList(cmd, filepath.Dir(execPath))
+	prependDirToPathList(env, filepath.Dir(execPath))
+
+	commandLine := []string{execPath}
+	commandLine = append(commandLine, args...)
+	return execPath, commandLine, env
+}
+
+func execBazel(bazel string, args []string, config config.Config) (int, error) {
+	if runtime.GOOS == "windows" {
+		// syscall.Exec is not supported on windows
+		return runBazel(bazel, args, nil, config)
+	}
+
+	execPath, args, env := makeBazelCmd(bazel, args, config)
+
+	err := syscall.Exec(execPath, args, env)
+	return 1, fmt.Errorf("could not start Bazel: %v", err)
+}
+
+func runBazel(bazel string, args []string, out io.Writer, config config.Config) (int, error) {
+	execPath, commandLine, env := makeBazelCmd(bazel, args, config)
+
+	cmd := exec.Command(execPath, commandLine[1:]...)
+	cmd.Env = env
 	cmd.Stdin = os.Stdin
 	if out == nil {
 		cmd.Stdout = os.Stdout
@@ -561,11 +583,7 @@ func makeBazelCmd(bazel string, args []string, out io.Writer, config config.Conf
 		cmd.Stdout = out
 	}
 	cmd.Stderr = os.Stderr
-	return cmd
-}
 
-func runBazel(bazel string, args []string, out io.Writer, config config.Config) (int, error) {
-	cmd := makeBazelCmd(bazel, args, out, config)
 	err := cmd.Start()
 	if err != nil {
 		return 1, fmt.Errorf("could not start Bazel: %v", err)
